@@ -1,0 +1,78 @@
+name: 采集价格
+
+on:
+  schedule:
+    # GitHub 用 UTC。北京时间 12:00 = 04:00 UTC，23:00 = 15:00 UTC
+    - cron: "0 4 * * *"
+    - cron: "0 15 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: price-collect
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装无头浏览器（解 ZOL 频率校验）
+        run: |
+          set -e
+          if ! command -v google-chrome >/dev/null 2>&1; then
+            wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq /tmp/chrome.deb
+          fi
+          google-chrome --version
+
+      - name: 抓取价格
+        id: price
+        continue-on-error: true
+        run: |
+          for i in 1 2 3; do
+            echo "===== 第 $i 次尝试 ====="
+            if python scraper/scraper.py; then
+              echo "抓取成功"
+              exit 0
+            fi
+            if [ "$i" -lt 3 ]; then
+              echo "失败，90 秒后重试"
+              sleep 90
+            fi
+          done
+          echo "三次均失败"
+          exit 1
+
+      - name: 抓取资讯
+        if: always()
+        continue-on-error: true
+        run: python scraper/news.py
+
+      - name: 提交数据
+        if: always()
+        run: |
+          git config user.name "price-bot"
+          git config user.email "price-bot@users.noreply.github.com"
+          git add -A data
+          if git diff --cached --quiet; then
+            echo "数据无变化，不提交"
+          else
+            git commit -m "data: $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M') 自动采集"
+            git push
+          fi
+
+      - name: 标记结果
+        if: steps.price.outcome != 'success'
+        run: |
+          echo "本次采集失败，失败记录已写入 data/collect-log.json"
+          exit 1

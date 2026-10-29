@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+scraper/cache/
+scraper/*.bak.py
+.codebuddy/
+.cloudstudio
+.DS_Store
