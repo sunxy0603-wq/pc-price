@@ -1323,7 +1323,21 @@
   /* 线上从 GitHub 仓库读（Actions 定时抓取后自动 commit），本地开发读同目录 data/ */
   var REPO_RAW = 'https://raw.githubusercontent.com/sunxy0603-wq/pc-price/main/';
   var IS_LOCAL = /^(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0)$/.test(location.hostname) || location.protocol === 'file:';
-  var DATA_BASE = IS_LOCAL ? 'data/' : REPO_RAW + 'data/';
+  /* 站在 GitHub Pages 上时同源读取（走 CDN，国内更快）；打包成 App 或别处打开时走 raw 直链 */
+  var ON_PAGES = /\.github\.io$/i.test(location.hostname);
+  var DATA_BASE = (IS_LOCAL || ON_PAGES) ? 'data/' : REPO_RAW + 'data/';
+
+  /* 主源失败自动切备用源，避免某一端被墙就白屏 */
+  function fetchData(name, bust, opts){
+    var q = bust ? '?t=' + Date.now() : '';
+    var alt = DATA_BASE === 'data/' ? REPO_RAW + 'data/' : 'data/';
+    return fetch(DATA_BASE + name + q, opts || {}).then(function(r){
+      if (r.ok) return r;
+      return fetch(alt + name + q, opts || {});
+    }).catch(function(){
+      return fetch(alt + name + q, opts || {});
+    });
+  }
 
   var PRODUCTS = [], DATES = [], INDEX = [];
   var META = { minReal: 0, source: '', updated: '', day: '', realSince: '', bytes: 0, loadMs: 0 };
@@ -1342,7 +1356,7 @@
   }
 
   function loadData(bust){
-    return fetch(DATA_BASE + 'data.json' + (bust ? '?t=' + Date.now() : ''), { cache: 'no-store' })
+    return fetchData('data.json', bust, { cache: 'no-store' })
       .then(function(r){
         if (!r.ok) throw new Error('HTTP ' + r.status);
         var cl = +(r.headers.get('Content-Length') || 0);
@@ -2343,7 +2357,7 @@
 
   function loadNews(){
     news.loaded = true;
-    fetch(DATA_BASE + 'news.json?t=' + Date.now(), { cache: 'no-store' })
+    fetchData('news.json', true, { cache: 'no-store' })
       .then(function(r){
         if (!r.ok) throw new Error('HTTP ' + r.status);
         return r.json();
@@ -2941,7 +2955,7 @@
     if (!box) return;
     box.innerHTML = '<div class="log-empty">加载中…</div>';
 
-    fetch(DATA_BASE + 'collect-log.json?t=' + Date.now(), { cache: 'no-store' })
+    fetchData('collect-log.json', true, { cache: 'no-store' })
       .then(function(r){
         if (!r.ok) throw new Error('HTTP ' + r.status);
         return r.json();
