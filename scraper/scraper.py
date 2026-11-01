@@ -37,6 +37,9 @@ CACHE_DIR = os.path.join(BASE, "cache")
 DAYS = 365
 PAGES = int(os.environ.get("ZOL_PAGES", "3"))   # 每个品类抓几页，页数越多覆盖越全
 MIN_PRODUCTS = 400   # 抓取数量低于此值视为被风控，中止发布
+POOL_MAX = int(os.environ.get("ZOL_POOL_MAX", "1000"))     # 固定跟踪池上限
+DETAIL_MAX = int(os.environ.get("ZOL_DETAIL_MAX", "700"))  # 单场最多补采多少个详情页
+DETAIL_SLEEP = float(os.environ.get("ZOL_DETAIL_SLEEP", "0.85"))
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -193,6 +196,71 @@ def get_page(cat, url, force=False, page=1):
         with open(cache, "w", encoding="utf-8") as f:
             f.write(html)
     return html, mode
+
+
+def fetch_detail_price(url):
+    """从商品详情页取当前报价。
+
+    ZOL 列表页每次返回的商品集合会轮换，同一型号不一定每天出现在列表里。
+    对「固定池里今天没被列表页命中」的商品，改用详情页续价，保证曲线不断。
+    返回 int 价格，失败返回 None。"""
+    if not url:
+        return None
+    try:
+        html = fetch_http(url)
+    except Exception:
+        return None
+    if looks_blocked(html):
+        return None
+    m = re.search(r'<b class="price-type"[^>]*>([\d,]+)(?:-([\d,]+))?</b>', html)
+    if not m:
+        m = re.search(r'class="price[^"]*"[^>]*>\s*[¥￥]?\s*([\d,]{3,7})', html)
+    if not m:
+        return None
+    try:
+        v = int(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+    return v if v > 0 else None
+
+
+POOL_PATH = os.path.join(DATA_DIR, "pool.json")
+
+
+def load_pool():
+    """固定跟踪池：见过一次的型号就长期跟，不因列表页轮换而丢掉"""
+    if not os.path.exists(POOL_PATH):
+        return {}
+    try:
+        d = json.load(open(POOL_PATH, encoding="utf-8"))
+        return {p["pid"]: p for p in d.get("items", []) if p.get("pid")}
+    except Exception as e:
+        print("  · 池读取失败：", e)
+        return {}
+
+
+def save_pool(pool, products, day):
+    """把本期出现过的型号并入池，按最后出现日期淘汰超限的部分"""
+    for it in products:
+        pid = it["pid"]
+        if pid in pool:
+            pool[pid]["lastSeen"] = day
+            pool[pid]["name"] = it.get("name") or pool[pid].get("name", "")
+        else:
+            pool[pid] = {"pid": pid, "name": it.get("name", ""), "cat": it.get("cat", ""),
+                         "brand": it.get("brand", ""), "url": it.get("url", ""), "lastSeen": day}
+    if len(pool) > POOL_MAX:
+        keep = sorted(pool.values(), key=lambda x: x.get("lastSeen", ""), reverse=True)[:POOL_MAX]
+        pool = {p["pid"]: p for p in keep}
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp = POOL_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"updated": day, "items": list(pool.values())}, f, ensure_ascii=False)
+        os.replace(tmp, POOL_PATH)
+        print(f"固定池已保存 {len(pool)} 款 -> data/pool.json")
+    except Exception as e:
+        print("  · 池保存失败：", e)
 
 
 def clean_name(s):
@@ -361,12 +429,57 @@ def main():
             seen.add(it["pid"])
             all_items.append(it)
 
+    # ---------- 固定池补采 ----------
+    # 列表页每场回来的型号会变，老商品容易断档；用上一版 data.json 当固定池，
+    # 把今天列表页没出现、但历史上有过的型号逐个走详情页取价，曲线才接得上。
+    pool = load_pool()
+    if not pool:
+        old_path = os.path.join(DATA_DIR, "data.json")
+        if os.path.exists(old_path):
+            try:
+                old = json.load(open(old_path, encoding="utf-8"))
+                for p in old.get("products", []):
+                    if p.get("pid") and p.get("url"):
+                        pool[p["pid"]] = p
+            except Exception as e:
+                print("  · 旧数据读取失败：", e)
+
+    if pool:
+        pool_sorted = sorted(pool.values(), key=lambda x: -(x.get("realDays") or 0))[:POOL_MAX]
+        got_pids = {it["pid"] for it in all_items}
+        missing = [p for p in pool_sorted if p["pid"] not in got_pids]
+        print(f"\n固定池 {len(pool_sorted)} 款 · 列表页命中 {len(pool_sorted) - len(missing)} 款 · 待补 {len(missing)} 款")
+        filled = 0
+        for i, p in enumerate(missing[:DETAIL_MAX], 1):
+            price = fetch_detail_price(p["url"])
+            if price:
+                all_items.append({
+                    "pid": p["pid"], "name": p["name"], "cat": p["cat"],
+                    "brand": p.get("brand", ""), "url": p["url"], "price": price,
+                })
+                filled += 1
+            if i % 100 == 0:
+                print(f"  补采 {i}/{min(len(missing), DETAIL_MAX)} · 成功 {filled}")
+            time.sleep(DETAIL_SLEEP + random.uniform(0, 0.35))
+        print(f"详情页补采完成：成功 {filled} 款")
+
+    save_pool(pool, all_items, day)
+
     dedup = {}
     for it in all_items:
         k = (it["cat"], re.sub(r"\s+", "", it["name"]).lower())
         if k not in dedup or it["price"] > dedup[k]["price"]:
             dedup[k] = it
     products = sorted(dedup.values(), key=lambda x: (x["cat"], -x["price"]))
+
+    # 品类计数按最终列表重算（含补采进来的）
+    label_of = {k: lbl for k, lbl, _ in CATS}
+    cat_counts = {}
+    for it in products:
+        lbl = label_of.get(it["cat"], it["cat"])
+        cat_counts[lbl] = cat_counts.get(lbl, 0) + 1
+    for _, label, _ in CATS:
+        cat_counts.setdefault(label, 0)
 
     # 数据闸门：抓取量异常直接中止，避免把坏数据发上线
     if len(products) < MIN_PRODUCTS:

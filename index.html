@@ -1918,6 +1918,7 @@
       var l2 = lastIdx(p.prices);
       var e2 = l2 >= 0 ? p.prices[l2] : null;
       var s2 = at(p.prices, Math.max(0, l2 - n));
+      if (s2 == null) s2 = at(p.prices, firstIdx(p.prices));   /* 选的区间比实际数据长，用最早一期 */
       var v2 = (e2 != null && s2 != null) ? (e2 / s2 - 1) * 100 : null;
       $('#idxVal').textContent = e2 != null ? fmtPrice(e2) : '—';
       ch.textContent = fmtPct(v2);
@@ -2138,6 +2139,7 @@
 
     if (!q || '配件价格指数'.indexOf(q) >= 0 || 'index'.indexOf(q) >= 0){
       var _ie = at(INDEX, DAYS - 1), _is = at(INDEX, Math.max(0, DAYS - 1 - state.range));
+      if (_is == null) _is = at(INDEX, firstIdx(INDEX));
       var iv = (_ie != null && _is != null) ? (_ie / _is - 1) * 100 : null;
       html += '<div class="pl-item' + (state.inst.type === 'index' ? ' on' : '') + '" data-type="index">' +
         '<span class="n">配件价格指数<em>全部 ' + PRODUCTS.length + ' 款等权</em></span>' +
