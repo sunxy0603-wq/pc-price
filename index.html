@@ -1281,7 +1281,7 @@
   function dstr(d){ return (d.getMonth()+1) + '/' + d.getDate(); }
   function dfull(d){ return d.getFullYear() + '/' + String(d.getMonth()+1).padStart(2,'0') + '/' + String(d.getDate()).padStart(2,'0'); }
 
-  function fmtPrice(v){ return '¥' + Math.round(v).toLocaleString('zh-CN'); }
+  function fmtPrice(v){ if (v == null || !isFinite(v)) return '—'; return '¥' + Math.round(v).toLocaleString('zh-CN'); }
   function fmtPct(v){
     if (v == null || isNaN(v)) return '—';
     if (Math.abs(v) < 0.005) return '0.00%';
@@ -1545,9 +1545,14 @@
     var refVal = isPct ? 0 : data[b0];
     var col = data[b1] >= refVal ? C_UP : C_DOWN;
     var estimated = false;   /* 已取消回溯估算，全部为真实点 */
+    /* 刻度精度自适应：量程很小时（比如指数几乎不动）必须给小数位，
+       否则 5 个刻度会全部显示成 1000，看起来像图表坏了 */
+    var stepV = (mx - mn) / 4;
+    var dec = stepV > 0 ? Math.ceil(-Math.log10(stepV)) + 1 : 0;
+    dec = Math.max(0, Math.min(2, dec));
     var fy = isPct
-      ? function(v){ return (v >= 0 ? '+' : '') + v.toFixed(1) + '%'; }
-      : function(v){ return v.toFixed(0); };
+      ? function(v){ return (v >= 0 ? '+' : '') + v.toFixed(Math.max(1, dec)) + '%'; }
+      : function(v){ return v.toFixed(dec); };
 
     // 网格 + 右侧刻度
     ctx.font = '10.5px -apple-system,"PingFang SC",sans-serif';
@@ -2282,32 +2287,47 @@
     $('#drMeta').textContent = CATS[p.cat].name + ' · ' + p.brand + ' · 日更新';
     $('#drPrice').textContent = fmtPrice(p.base);
 
-    var chg = p.chg.d90;
+    /* 实际跨度：从第一个有效报价到最新一期，只有 1 个点则没有对比基准 */
+    var fi = firstIdx(p.prices), li = lastIdx(p.prices);
+    var realSpan = (fi >= 0 && li > fi) ? (li - fi) : 0;
+    var chg = realSpan > 0 ? p.chg.d90 : null;
     var cs = $('#drChg');
     cs.textContent = fmtPct(chg);
     cs.className = 'num ' + pctClass(chg);
     cs.style.color = pctColor(chg);
-    $('#drDays').textContent = '近 90 天';
+    $('#drDays').textContent = realSpan > 0 ? '近 ' + (realSpan + 1) + ' 天' : '仅 1 期报价';
 
-    var vols = [], sm = softSeries(p.prices, 4);
-    for (var i = 1; i < DAYS; i++) vols.push(sm[i] / sm[i-1] - 1);
-    var mean = vols.reduce(function(a,b){ return a+b; }, 0) / vols.length;
-    var variance = vols.reduce(function(a,b){ return a + (b-mean)*(b-mean); }, 0) / vols.length;
-    var annVol = Math.sqrt(variance) * Math.sqrt(252) * 100;
+    /* 波动率只在「相邻两天都有报价」时计入，跳过空档，避免跨期当成一天 */
+    var vols = [];
+    for (var i = 1; i < DAYS; i++){
+      if (p.prices[i] != null && p.prices[i-1] != null) vols.push(p.prices[i] / p.prices[i-1] - 1);
+    }
+    var annVol = null;
+    if (vols.length >= 1){
+      var mean = vols.reduce(function(a,b){ return a+b; }, 0) / vols.length;
+      var variance = vols.reduce(function(a,b){ return a + (b-mean)*(b-mean); }, 0) / vols.length;
+      annVol = Math.sqrt(variance) * Math.sqrt(252) * 100;
+      if (!isFinite(annVol)) annVol = null;
+    }
 
-    var p30 = p.prices.slice(DAYS-30);
-    var hi30 = Math.max.apply(null, p30), lo30 = Math.min.apply(null, p30);
+    var pAll = p.prices.filter(function(v){ return v != null; });
+    var p30 = p.prices.slice(Math.max(0, DAYS-30)).filter(function(v){ return v != null; });
+    var hi30 = p30.length ? Math.max.apply(null, p30) : null;
+    var lo30 = p30.length ? Math.min.apply(null, p30) : null;
+    var rd = p.realDays || 0;
+    var spanName = rd >= 300 ? '近一年' : '近 ' + rd + ' 天';
+    var volTxt = annVol == null ? '—' : annVol.toFixed(1) + '%';
 
     $('#drStats').innerHTML =
-      '<div><div class="k">近一年最高</div><div class="v num">' + fmtPrice(p.max) + '</div></div>' +
-      '<div><div class="k">近一年最低</div><div class="v num">' + fmtPrice(p.min) + '</div></div>' +
-      '<div><div class="k">近一年均价</div><div class="v num">' + fmtPrice(p.avg) + '</div></div>' +
-      '<div><div class="k">年化波动率</div><div class="v num">' + annVol.toFixed(1) + '%</div></div>' +
+      '<div><div class="k">' + spanName + '最高</div><div class="v num">' + fmtPrice(p.max) + '</div></div>' +
+      '<div><div class="k">' + spanName + '最低</div><div class="v num">' + fmtPrice(p.min) + '</div></div>' +
+      '<div><div class="k">' + spanName + '均价</div><div class="v num">' + fmtPrice(p.avg) + '</div></div>' +
+      '<div><div class="k">年化波动率</div><div class="v num">' + volTxt + '</div></div>' +
       '<div><div class="k">30 日最高</div><div class="v num">' + fmtPrice(hi30) + '</div></div>' +
       '<div><div class="k">30 日最低</div><div class="v num">' + fmtPrice(lo30) + '</div></div>';
 
     var gap = (p.base / p.max - 1) * 100;
-    $('#drNote').textContent = '当前价较近一年高点' + (gap < 0 ? '低 ' + Math.abs(gap).toFixed(1) + '%' : '高 ' + gap.toFixed(1) + '%') +
+    $('#drNote').textContent = '当前价较' + spanName + '高点' + (gap < 0 ? '低 ' + Math.abs(gap).toFixed(1) + '%' : '高 ' + gap.toFixed(1) + '%') +
       '，较均价' + (p.base >= p.avg ? '高 ' : '低 ') + Math.abs((p.base / p.avg - 1) * 100).toFixed(1) + '%。报价抓取自中关村在线。';
 
     $('#drawer').classList.add('on');
