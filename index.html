@@ -1346,7 +1346,7 @@
   }
 
   var PRODUCTS = [], DATES = [], INDEX = [];
-  var META = { minReal: 0, source: '', updated: '', day: '', realSince: '', bytes: 0, loadMs: 0 };
+  var META = { minReal: 0, cmpCount: 0, source: '', updated: '', day: '', realSince: '', bytes: 0, loadMs: 0 };
 
   function buildIndex(list){
     var n = list[0].prices.length, i, k, sum, cnt, out = new Array(n), begin = -1;
@@ -1434,6 +1434,7 @@
         });
         INDEX = buildIndex(PRODUCTS);
         META.minReal = DAYS;   /* 只统计真实采集的日期数，不再用单品最小值 */
+        META.cmpCount = PRODUCTS.filter(function(p){ return p.realDays >= 2; }).length;
         return d;
       });
   }
@@ -3343,7 +3344,8 @@
     n.innerHTML =
       '<span class="n-dot"></span>' +
       '<span><b>数据源：' + META.source + '</b> · ' + PRODUCTS.length + ' 款在售配件 · 抓取于 ' + stamp +
-      '　已累计 <b>' + DAYS + '</b> 天真实报价（' + (META.realSince || META.day) + ' 起），每日 12:00 / 23:00 自动更新。' +
+      '　已累计 <b>' + DAYS + '</b> 天真实报价（' + (META.realSince || META.day) + ' 起），其中 <b>' + (META.cmpCount || 0) +
+      '</b> 款有多期报价可比对。上涨/下跌统计只计入这部分，其余为今日新增、明日起参与对比。' +
       '</span>';
   }
 
