@@ -1200,7 +1200,7 @@
         </div>
         <p class="set-about">
           装机行情是一个 PC 配件价格看板。报价抓取自中关村在线公开列表页，资讯来自 IT之家 RSS。
-          历史曲线在真实快照不足 30 天时为回溯估算，仅供趋势参考，不构成购买建议。<br>
+          所有曲线均为实际采集到的报价，没有回溯模拟；采集天数越多，可看的区间越长。<br>
           AI 的接口地址、模型与 Key 属于账号级配置，只能在「AI」页面的「API 设置」中管理，不在本页。
         </p>
       </section>
@@ -1283,20 +1283,22 @@
 
   function fmtPrice(v){ return '¥' + Math.round(v).toLocaleString('zh-CN'); }
   function fmtPct(v){
+    if (v == null || isNaN(v)) return '—';
     if (Math.abs(v) < 0.005) return '0.00%';
     return (v >= 0 ? '+' : '') + v.toFixed(2) + '%';
   }
-  function pctClass(v){ return v > 0.005 ? 'up-t' : (v < -0.005 ? 'down-t' : 'flat-t'); }
-  function pctColor(v){ return v > 0.005 ? C_UP : (v < -0.005 ? C_DOWN : C_MUTE); }
+  function pctClass(v){ return v == null ? 'flat-t' : (v > 0.005 ? 'up-t' : (v < -0.005 ? 'down-t' : 'flat-t')); }
+  function pctColor(v){ return v == null ? C_MUTE : (v > 0.005 ? C_UP : (v < -0.005 ? C_DOWN : C_MUTE)); }
 
   // 迷你图用的轻度平滑，避免报价台阶导致锯齿过重
   function softSeries(prices, win){
     var n = prices.length, w = win || 4, out = [], i, k, s, c;
     for (i = 0; i < n; i++){
+      if (prices[i] == null) continue;
       s = 0; c = 0;
       for (k = -w; k <= w; k++){
         var j = i + k;
-        if (j < 0 || j >= n) continue;
+        if (j < 0 || j >= n || prices[j] == null) continue;
         s += prices[j]; c++;
       }
       out.push(s / c);
@@ -1343,16 +1345,37 @@
   var META = { minReal: 0, source: '', updated: '', day: '', realSince: '', bytes: 0, loadMs: 0 };
 
   function buildIndex(list){
-    var n = list[0].prices.length, out = [1000], i, k, sum;
-    for (i = 1; i < n; i++){
-      sum = 0;
+    var n = list[0].prices.length, i, k, sum, cnt, out = new Array(n), begin = -1;
+    for (i = 0; i < n; i++){
+      for (k = 0; k < list.length; k++){ if (list[k].prices[i] != null) break; }
+      if (k < list.length){ begin = i; break; }
+    }
+    for (i = 0; i < n; i++) out[i] = null;
+    if (begin < 0) return out;
+    out[begin] = 1000;
+    for (i = begin + 1; i < n; i++){
+      sum = 0; cnt = 0;
       for (k = 0; k < list.length; k++){
         var s = list[k].prices;
-        sum += s[i] / s[i - 1] - 1;
+        if (s[i] != null && s[i - 1] != null){ sum += s[i] / s[i - 1] - 1; cnt++; }
       }
-      out.push(out[i - 1] * (1 + sum / list.length));
+      out[i] = cnt ? out[i - 1] * (1 + sum / cnt) : out[i - 1];
     }
     return out;
+  }
+
+  function firstIdx(a){
+    for (var i = 0; i < a.length; i++) if (a[i] != null) return i;
+    return -1;
+  }
+  function lastIdx(a){
+    for (var i = a.length - 1; i >= 0; i--) if (a[i] != null) return i;
+    return -1;
+  }
+  /* 取 idx 处或之前最近一个有效值；整段都空则返回 null */
+  function at(a, idx){
+    for (var i = Math.min(idx, a.length - 1); i >= 0; i--) if (a[i] != null) return a[i];
+    return null;
   }
 
   function loadData(bust){
@@ -1375,13 +1398,15 @@
         DAYS = DATES.length;
         PRODUCTS = d.products.map(function(p, i){
           var pr = p.series.slice();
-          var last = pr.length - 1;
-          var mn = Infinity, mx = -Infinity, sum = 0;
+          var last = lastIdx(pr);
+          var mn = Infinity, mx = -Infinity, sum = 0, cnt = 0;
           for (var z = 0; z < pr.length; z++){
-            sum += pr[z];
+            if (pr[z] == null) continue;
+            sum += pr[z]; cnt++;
             if (pr[z] < mn) mn = pr[z];
             if (pr[z] > mx) mx = pr[z];
           }
+          if (!cnt){ mn = p.price; mx = p.price; sum = p.price; cnt = 1; }
           return {
             id: i,
             pid: p.pid,
@@ -1393,25 +1418,38 @@
             url: p.url,
             min: mn,
             max: mx,
-            avg: sum / pr.length,
+            avg: sum / cnt,
             realDays: p.realDays || 0,
-            sp: softSeries(pr.slice(-90), 4),
+            sp: softSeries(pr, 4),
             chg: {
-              d7:  (pr[last] / pr[last - 7]  - 1) * 100,
-              d30: (pr[last] / pr[last - 30] - 1) * 100,
-              d90: (pr[last] / pr[last - 90] - 1) * 100
+              d7:  spanChg(pr, last, 7),
+              d30: spanChg(pr, last, 30),
+              d90: spanChg(pr, last, 90)
             }
           };
         });
         INDEX = buildIndex(PRODUCTS);
-        META.minReal = PRODUCTS.reduce(function(m, p){ return Math.min(m, p.realDays); }, 9999);
+        META.minReal = DAYS;   /* 只统计真实采集的日期数，不再用单品最小值 */
         return d;
       });
   }
 
+  /* 取 last 往前 days 天内最近的有效值算涨跌；不足则用最早的有效值；仍无则 null */
+  function spanChg(a, last, days){
+    if (last <= 0) return null;
+    var v = at(a, Math.max(0, last - days));
+    if (v == null) v = at(a, last - 1);   /* 窗口内没采到就往回取最近一个有效点 */
+    if (v == null) return null;
+    return (a[last] / v - 1) * 100;
+  }
+
   function rangePct(p, days){
-    var end = p.prices[DAYS-1], start = p.prices[Math.max(0, DAYS-1-days)];
-    return (end / start - 1) * 100;
+    var a = p.prices, last = lastIdx(a);
+    if (last <= 0) return 0;
+    var start = at(a, Math.max(0, last - days));
+    if (start == null) start = at(a, last - 1);
+    if (start == null) return 0;
+    return (a[last] / start - 1) * 100;
   }
 
   /* ================= 状态 ================= */
@@ -1444,15 +1482,16 @@
 
   // 取当前查看对象的序列：指数 or 单个配件
   function instSeries(n){
-    var start = DAYS - n;
+    var start = Math.max(0, DAYS - n);
     if (state.inst.type === 'index'){
       return { data: INDEX.slice(start), isPct: false, start: start, raw: null, product: null };
     }
     var prod = PRODUCTS[state.inst.id];
     var slice = prod.prices.slice(start);
-    var base = slice[0] || 1;
+    var fi = firstIdx(slice);
+    var base = fi >= 0 ? slice[fi] : 1;
     return {
-      data: slice.map(function(v){ return (v / base - 1) * 100; }),
+      data: slice.map(function(v){ return v == null ? null : (v / base - 1) * 100; }),
       raw: slice,
       isPct: true,
       start: start,
@@ -1477,27 +1516,35 @@
     var inst = instSeries(n);
     var data = inst.data;
     var isPct = inst.isPct;
+    var b0 = firstIdx(data), b1 = lastIdx(data);
+    if (b0 < 0 || b1 < 0) return;   /* 该对象还没有任何真实报价 */
 
     // 单品模式：叠加同期指数作为参照
-    var bench = null;
+    var bench = null, bb0 = -1;
     if (isPct){
-      var ib = INDEX[start] || 1;
-      bench = INDEX.slice(start).map(function(v){ return (v / ib - 1) * 100; });
+      var seg = INDEX.slice(start);
+      bb0 = firstIdx(seg);
+      if (bb0 >= 0){
+        var ib = seg[bb0];
+        bench = seg.map(function(v){ return v == null ? null : (v / ib - 1) * 100; });
+      }
     }
 
     var pad = { l: 6, r: 58, t: 18, b: 26 };
     var iw = W - pad.l - pad.r, ih = H - pad.t - pad.b;
-    var pool = bench ? data.concat(bench) : data;
-    var mn = Math.min.apply(null, pool), mx = Math.max.apply(null, pool);
+    var vals = [], q;
+    for (q = b0; q <= b1; q++) if (data[q] != null) vals.push(data[q]);
+    if (bench) for (q = bb0; q < bench.length; q++) if (bench[q] != null) vals.push(bench[q]);
+    var mn = Math.min.apply(null, vals), mx = Math.max.apply(null, vals);
     if (isPct){ mn = Math.min(mn, 0); mx = Math.max(mx, 0); }
     var span = (mx - mn) || 1;
     mn -= span * 0.14; mx += span * 0.14;
 
     var X = function(i){ return pad.l + iw * (i / (n - 1 || 1)); };
     var Y = function(v){ return pad.t + ih * (1 - (v - mn) / (mx - mn)); };
-    var refVal = isPct ? 0 : data[0];
-    var col = data[n-1] >= refVal ? C_UP : C_DOWN;
-    var estimated = META.minReal < 30;
+    var refVal = isPct ? 0 : data[b0];
+    var col = data[b1] >= refVal ? C_UP : C_DOWN;
+    var estimated = false;   /* 已取消回溯估算，全部为真实点 */
     var fy = isPct
       ? function(v){ return (v >= 0 ? '+' : '') + v.toFixed(1) + '%'; }
       : function(v){ return v.toFixed(0); };
@@ -1535,8 +1582,8 @@
     // 指数参照线
     if (bench){
       ctx.beginPath();
-      ctx.moveTo(X(0), Y(bench[0]));
-      for (var b = 1; b < n; b++) ctx.lineTo(X(b), Y(bench[b]));
+      ctx.moveTo(X(bb0), Y(bench[bb0]));
+      for (var b = bb0 + 1; b < n; b++) if (bench[b] != null) ctx.lineTo(X(b), Y(bench[b]));
       ctx.strokeStyle = 'rgba(160,176,198,.42)';
       ctx.lineWidth = 1.2;
       ctx.setLineDash([3, 4]);
@@ -1550,18 +1597,18 @@
     grad.addColorStop(.65, hexA(col, estimated ? .04 : .07));
     grad.addColorStop(1, hexA(col, 0));
     ctx.beginPath();
-    ctx.moveTo(X(0), Y(data[0]));
-    for (var i = 1; i < n; i++) ctx.lineTo(X(i), Y(data[i]));
-    ctx.lineTo(X(n-1), pad.t + ih);
-    ctx.lineTo(X(0), pad.t + ih);
+    ctx.moveTo(X(b0), Y(data[b0]));
+    for (var i = b0 + 1; i <= b1; i++) if (data[i] != null) ctx.lineTo(X(i), Y(data[i]));
+    ctx.lineTo(X(b1), pad.t + ih);
+    ctx.lineTo(X(b0), pad.t + ih);
     ctx.closePath();
     ctx.fillStyle = grad;
     ctx.fill();
 
     // 折线
     ctx.beginPath();
-    ctx.moveTo(X(0), Y(data[0]));
-    for (var j = 1; j < n; j++) ctx.lineTo(X(j), Y(data[j]));
+    ctx.moveTo(X(b0), Y(data[b0]));
+    for (var j = b0 + 1; j <= b1; j++) if (data[j] != null) ctx.lineTo(X(j), Y(data[j]));
     ctx.strokeStyle = col;
     ctx.lineWidth = estimated ? 1.5 : 1.9;
     ctx.lineJoin = 'round';
@@ -1599,7 +1646,7 @@
     }
 
     // 末端点
-    var lx = X(n-1), ly = Y(data[n-1]);
+    var lx = X(b1), ly = Y(data[b1]);
     ctx.beginPath();
     ctx.arc(lx, ly, 8, 0, Math.PI*2);
     ctx.fillStyle = hexA(col, .16);
@@ -1628,7 +1675,7 @@
     }
 
     // hover
-    if (state.hover >= 0 && state.hover < n){
+    if (state.hover >= b0 && state.hover <= b1 && data[state.hover] != null){
       var hx = X(state.hover), hy = Y(data[state.hover]);
       ctx.save();
       ctx.setLineDash([3, 4]);
@@ -1650,9 +1697,9 @@
       var hv = state.hover;
       var dayChg = 0;
       if (isPct && inst.raw){
-        dayChg = hv > 0 ? (inst.raw[hv] / inst.raw[hv-1] - 1) * 100 : 0;
+        dayChg = (hv > 0 && inst.raw[hv-1] != null) ? (inst.raw[hv] / inst.raw[hv-1] - 1) * 100 : 0;
       } else {
-        dayChg = hv > 0 ? (data[hv] / data[hv-1] - 1) * 100 : 0;
+        dayChg = (hv > 0 && data[hv-1] != null) ? (data[hv] / data[hv-1] - 1) * 100 : 0;
       }
 
       var tip = $('#tip');
@@ -1693,7 +1740,9 @@
     var p = prep(canvas);
     if (!p) return;
     var ctx = p.ctx, W = p.w, H = p.h;
+    prices = prices.filter(function(v){ return v != null; });
     var n = prices.length;
+    if (n < 2) return;
     var mn = Math.min.apply(null, prices), mx = Math.max.apply(null, prices);
     var span = (mx - mn) || 1;
     var X = function(i){ return 1 + (W - 2) * (i / (n - 1 || 1)); };
@@ -1733,18 +1782,22 @@
     }
     var ctx = p.ctx, W = p.w, H = p.h;
     var n = Math.min(state.drRange, DAYS);
-    var start = DAYS - n;
+    var start = Math.max(0, DAYS - n);
     var data = prod.prices.slice(start);
     var labels = DATES.slice(start);
+    var b0 = firstIdx(data), b1 = lastIdx(data);
+    if (b0 < 0 || b1 < 0) return;
 
     var pad = { l: 6, r: 54, t: 14, b: 22 };
     var iw = W - pad.l - pad.r, ih = H - pad.t - pad.b;
-    var mn = Math.min.apply(null, data), mx = Math.max.apply(null, data);
+    var vals = [], q;
+    for (q = b0; q <= b1; q++) if (data[q] != null) vals.push(data[q]);
+    var mn = Math.min.apply(null, vals), mx = Math.max.apply(null, vals);
     var span = (mx - mn) || 1;
     mn -= span * 0.18; mx += span * 0.18;
     var X = function(i){ return pad.l + iw * (i / (n - 1 || 1)); };
     var Y = function(v){ return pad.t + ih * (1 - (v - mn) / (mx - mn)); };
-    var up = data[n-1] >= data[0];
+    var up = data[b1] >= data[b0];
     var col = up ? C_UP : C_DOWN;
 
     ctx.font = '10px -apple-system,"PingFang SC",sans-serif';
@@ -1763,27 +1816,28 @@
     grad.addColorStop(0, hexA(col, .28));
     grad.addColorStop(1, hexA(col, .02));
     ctx.beginPath();
-    ctx.moveTo(X(0), Y(data[0]));
-    for (var i = 1; i < n; i++) ctx.lineTo(X(i), Y(data[i]));
-    ctx.lineTo(X(n-1), pad.t + ih); ctx.lineTo(X(0), pad.t + ih);
+    ctx.moveTo(X(b0), Y(data[b0]));
+    for (var i = b0 + 1; i <= b1; i++) if (data[i] != null) ctx.lineTo(X(i), Y(data[i]));
+    ctx.lineTo(X(b1), pad.t + ih); ctx.lineTo(X(b0), pad.t + ih);
     ctx.closePath(); ctx.fillStyle = grad; ctx.fill();
 
     ctx.beginPath();
-    ctx.moveTo(X(0), Y(data[0]));
-    for (var j = 1; j < n; j++) ctx.lineTo(X(j), Y(data[j]));
+    ctx.moveTo(X(b0), Y(data[b0]));
+    for (var j = b0 + 1; j <= b1; j++) if (data[j] != null) ctx.lineTo(X(j), Y(data[j]));
     ctx.strokeStyle = col; ctx.lineWidth = 1.8; ctx.lineJoin = 'round';
     ctx.shadowColor = hexA(col, .45); ctx.shadowBlur = 8;
     ctx.stroke();
     ctx.shadowBlur = 0;
 
     ctx.beginPath();
-    ctx.arc(X(n-1), Y(data[n-1]), 3, 0, Math.PI*2);
+    ctx.arc(X(b1), Y(data[b1]), 3, 0, Math.PI*2);
     ctx.fillStyle = col; ctx.fill();
 
     ctx.font = '10px -apple-system,"PingFang SC",sans-serif';
     ctx.fillStyle = '#4f5d6e';
     ctx.textBaseline = 'top';
-    [0, Math.floor(n/2), n-1].forEach(function(idx, k){
+    var mid = Math.round((b0 + b1) / 2);
+    [b0, mid, b1].forEach(function(idx, k){
       ctx.textAlign = k === 0 ? 'left' : (k === 2 ? 'right' : 'center');
       ctx.fillText(dstr(labels[idx]), X(idx), pad.t + ih + 7);
     });
@@ -1791,31 +1845,34 @@
 
   /* ================= 渲染：统计 ================= */
   function renderStats(){
-    var n = state.range;
-    var idxEnd = INDEX[DAYS-1], idxStart = INDEX[DAYS-1-n];
-    var idxChg = (idxEnd / idxStart - 1) * 100;
+    var n = Math.min(state.range, Math.max(1, DAYS - 1));
+    var idxEnd = at(INDEX, DAYS - 1), idxStart = at(INDEX, DAYS - 1 - n);
+    var idxChg = (idxEnd != null && idxStart != null) ? (idxEnd / idxStart - 1) * 100 : null;
 
-    $('#sIndex').textContent = idxEnd.toFixed(1);
-    $('#sIndex').style.color = idxChg >= 0 ? C_UP : C_DOWN;
+    $('#sIndex').textContent = idxEnd != null ? idxEnd.toFixed(1) : '—';
+    $('#sIndex').style.color = pctColor(idxChg);
     $('#sIndexSub').innerHTML = '近 ' + n + ' 天 <b style="color:' + pctColor(idxChg) + '">' + fmtPct(idxChg) + '</b>';
 
+    /* 只有一个采样点的配件无法算涨跌，统计时排除，避免把「没数据」当成「持平」 */
+    var pool = PRODUCTS.filter(function(p){ return p.realDays >= 2; });
     var up = 0, down = 0, sum = 0, best = null, bestV = -1e9;
-    PRODUCTS.forEach(function(p){
+    pool.forEach(function(p){
       var v = rangePct(p, n);
       sum += v;
       if (v > 0.005) up++; else if (v < -0.005) down++;
       if (v > bestV){ bestV = v; best = p; }
     });
-    var avg = sum / PRODUCTS.length;
+    var avg = pool.length ? sum / pool.length : 0;
 
     $('#sUp').textContent = up;
-    $('#sUpSub').textContent = '占比 ' + Math.round(up / PRODUCTS.length * 100) + '% · 平均 ' + fmtPct(avg);
+    $('#sUpSub').textContent = '占比 ' + Math.round(up / Math.max(1, pool.length) * 100) + '% · 平均 ' + fmtPct(avg);
     $('#sDown').textContent = down;
-    $('#sDownSub').textContent = '占比 ' + Math.round(down / PRODUCTS.length * 100) + '% · 持平 ' + (PRODUCTS.length - up - down);
+    $('#sDownSub').textContent = '占比 ' + Math.round(down / Math.max(1, pool.length) * 100) + '% · 持平 ' + (pool.length - up - down);
 
-    $('#sTop').textContent = fmtPct(bestV);
-    $('#sTop').style.color = bestV >= 0 ? C_UP : C_DOWN;
-    $('#sTopSub').textContent = best.name;
+    var topFlat = !best || Math.abs(bestV) < 0.005;
+    $('#sTop').textContent = best ? fmtPct(bestV) : '—';
+    $('#sTop').style.color = pctColor(topFlat ? null : bestV);
+    $('#sTopSub').textContent = topFlat ? '近期报价平稳' : best.name;
 
     updateHead();
   }
@@ -1826,20 +1883,22 @@
     var ch = $('#idxChg');
     var label = $('#pickerLabel');
     if (state.inst.type === 'index'){
-      var end = INDEX[DAYS - 1], st = INDEX[DAYS - 1 - n];
-      var v = (end / st - 1) * 100;
-      $('#idxVal').textContent = end.toFixed(1);
+      var end = at(INDEX, DAYS - 1), st = at(INDEX, DAYS - 1 - Math.min(n, DAYS - 1));
+      var v = (end != null && st != null) ? (end / st - 1) * 100 : null;
+      $('#idxVal').textContent = end != null ? end.toFixed(1) : '—';
       ch.textContent = fmtPct(v);
-      ch.className = 'idx-chg num ' + (v >= 0 ? 'up' : 'down');
+      ch.className = 'idx-chg num ' + (v == null ? 'flat' : (v >= 0 ? 'up' : 'down'));
       label.textContent = '配件价格指数';
       label.title = '全部 ' + PRODUCTS.length + ' 款配件的等权价格指数';
     } else {
       var p = PRODUCTS[state.inst.id];
-      var e2 = p.prices[DAYS - 1], s2 = p.prices[Math.max(0, DAYS - 1 - n)];
-      var v2 = (e2 / s2 - 1) * 100;
-      $('#idxVal').textContent = fmtPrice(e2);
+      var l2 = lastIdx(p.prices);
+      var e2 = l2 >= 0 ? p.prices[l2] : null;
+      var s2 = at(p.prices, Math.max(0, l2 - n));
+      var v2 = (e2 != null && s2 != null) ? (e2 / s2 - 1) * 100 : null;
+      $('#idxVal').textContent = e2 != null ? fmtPrice(e2) : '—';
       ch.textContent = fmtPct(v2);
-      ch.className = 'idx-chg num ' + (v2 >= 0 ? 'up' : 'down');
+      ch.className = 'idx-chg num ' + (v2 == null ? 'flat' : (v2 >= 0 ? 'up' : 'down'));
       label.textContent = p.name;
       label.title = p.name;
     }
@@ -1847,12 +1906,16 @@
 
   /* ================= 渲染：榜单 ================= */
   function renderRank(){
-    var list = PRODUCTS.map(function(p){
+    var list = PRODUCTS.filter(function(p){ return p.realDays >= 2; }).map(function(p){
       return { p: p, v: pctRangeWithDr(p) };
     });
     function pctRangeWithDr(p){ return rangePct(p, state.range); }
 
     list.sort(function(a, b){ return state.rank === 'up' ? b.v - a.v : a.v - b.v; });
+    /* 价格完全没动的排在后面，避免榜单被一堆 0.00% 占满 */
+    var moved = list.filter(function(it){ return Math.abs(it.v) > 0.005; });
+    var still = list.filter(function(it){ return Math.abs(it.v) <= 0.005; });
+    list = moved.concat(still);
     var used = {};
     list = list.filter(function(it){
       var c = it.p.cat;
@@ -2051,10 +2114,11 @@
     var html = '';
 
     if (!q || '配件价格指数'.indexOf(q) >= 0 || 'index'.indexOf(q) >= 0){
-      var iv = (INDEX[DAYS - 1] / INDEX[Math.max(0, DAYS - 1 - state.range)] - 1) * 100;
+      var _ie = at(INDEX, DAYS - 1), _is = at(INDEX, Math.max(0, DAYS - 1 - state.range));
+      var iv = (_ie != null && _is != null) ? (_ie / _is - 1) * 100 : null;
       html += '<div class="pl-item' + (state.inst.type === 'index' ? ' on' : '') + '" data-type="index">' +
         '<span class="n">配件价格指数<em>全部 ' + PRODUCTS.length + ' 款等权</em></span>' +
-        '<span class="p num">' + INDEX[DAYS - 1].toFixed(1) + '</span>' +
+        '<span class="p num">' + (at(INDEX, DAYS - 1) != null ? at(INDEX, DAYS - 1).toFixed(1) : '—') + '</span>' +
         '<span class="ch num ' + pctClass(iv) + '">' + fmtPct(iv) + '</span>' +
       '</div>';
     }
@@ -2129,9 +2193,10 @@
     var html = '<button class="chip' + (state.cat === 'all' ? ' on' : '') + '" data-c="all">全部<span class="cnt">' + PRODUCTS.length + '</span></button>';
     CAT_ORDER.forEach(function(k){
       var arr = PRODUCTS.filter(function(p){ return p.cat === k; });
+      var cmp = arr.filter(function(p){ return p.realDays >= 2; });
       var avg = 0;
-      arr.forEach(function(p){ avg += rangePct(p, state.range); });
-      avg = avg / arr.length;
+      cmp.forEach(function(p){ avg += rangePct(p, state.range); });
+      avg = cmp.length ? avg / cmp.length : 0;
       html += '<button class="chip' + (state.cat === k ? ' on' : '') + '" data-c="' + k + '">' +
         CATS[k].name + '<span class="cnt num" style="color:' + pctColor(avg) + '">' + fmtPct(avg) + '</span></button>';
     });
@@ -2162,6 +2227,9 @@
       var av, bv;
       if (key === 'price'){ av = a.base; bv = b.base; }
       else { av = a.chg[key]; bv = b.chg[key]; }
+      if (av == null && bv == null) return 0;
+      if (av == null) return 1;
+      if (bv == null) return -1;
       return (av - bv) * state.dir;
     });
 
@@ -2197,7 +2265,7 @@
     $('#footNote').innerHTML =
       '共 <b style="color:#a9b8ca">' + rows.length + '</b> 款配件 · ' +
       '价格为人民币含税报价，抓取自中关村在线公开列表页，每日更新。<br>' +
-      '历史曲线在真实快照不足 30 天时为回溯估算，仅供趋势参考；报价随渠道与地区浮动，不构成购买建议。';
+      '所有曲线均为实际采集的报价，未做回溯模拟；报价随渠道与地区浮动，不构成购买建议。';
   }
 
   /* ================= 抽屉 ================= */
@@ -2313,9 +2381,10 @@
     CAT_ORDER.forEach(function(k){
       var arr = PRODUCTS.filter(function(p){ return p.cat === k; });
       if (!arr.length) return;
+      var cmp = arr.filter(function(p){ return p.realDays >= 2; });
       var sum = 0;
-      arr.forEach(function(p){ sum += rangePct(p, state.range); });
-      var avg = sum / arr.length;
+      cmp.forEach(function(p){ sum += rangePct(p, state.range); });
+      var avg = cmp.length ? sum / cmp.length : 0;
       max = Math.max(max, Math.abs(avg));
       rows.push({ k: k, v: avg, n: arr.length });
     });
@@ -2521,7 +2590,7 @@
       '各品类近 ' + n + ' 天平均涨跌：' + cats.join('，') + '。',
       '区间涨幅前五：' + top.join('；') + '。',
       '区间跌幅前五：' + low.join('；') + '。',
-      '注意：除最新一天外，历史曲线为回溯估算，趋势方向可参考，绝对数值不必过度解读。'
+      '注意：曲线只包含实际采集到的报价，没有采到的日期不做补值，因此早期区间可能较短。'
     ].join('\n');
   }
 
@@ -3193,8 +3262,10 @@
         // 同步顶部涨跌描述
         var p = state.current;
         if (!p) return;
-        var end = p.prices[DAYS-1], start = p.prices[Math.max(0, DAYS-1-state.drRange)];
-        var v = (end / start - 1) * 100;
+        var last = lastIdx(p.prices);
+        var end = last >= 0 ? p.prices[last] : null;
+        var start = at(p.prices, Math.max(0, last - state.drRange));
+        var v = (end != null && start != null) ? (end / start - 1) * 100 : null;
         var cs = $('#drChg');
         cs.textContent = fmtPct(v);
         cs.className = 'num ' + pctClass(v);
@@ -3231,14 +3302,11 @@
     $('#updTime').textContent = '抓取于 ' + stamp;
 
     var n = $('#notice');
-    var realOK = META.minReal >= 30;
     n.hidden = false;
     n.innerHTML =
       '<span class="n-dot"></span>' +
       '<span><b>数据源：' + META.source + '</b> · ' + PRODUCTS.length + ' 款在售配件 · 抓取于 ' + stamp +
-      (realOK
-        ? '　历史曲线中实线为真实报价区间，虚线为回溯估算。'
-        : '　当前仅有 ' + META.minReal + ' 天真实快照，曲线为回溯估算（虚线），每日重跑采集脚本即可逐步转为真实。') +
+      '　已累计 <b>' + DAYS + '</b> 天真实报价（' + (META.realSince || META.day) + ' 起），每日 12:00 / 23:00 自动更新。' +
       '</span>';
   }
 

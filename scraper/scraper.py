@@ -35,7 +35,8 @@ DATA_DIR = os.path.join(ROOT, "data")
 SNAP_DIR = os.path.join(DATA_DIR, "snapshots")
 CACHE_DIR = os.path.join(BASE, "cache")
 DAYS = 365
-MIN_PRODUCTS = 150   # 抓取数量低于此值视为被风控，中止发布
+PAGES = int(os.environ.get("ZOL_PAGES", "3"))   # 每个品类抓几页，页数越多覆盖越全
+MIN_PRODUCTS = 400   # 抓取数量低于此值视为被风控，中止发布
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -158,13 +159,20 @@ def looks_blocked(html):
     return (not html) or len(html) < 4000 or "service.zol.com.cn/checking" in html
 
 
-def get_page(cat, url, force=False):
+def page_url(base, page):
+    """ZOL 列表页分页规则：第 1 页 /cpu/，第 N 页 /cpu/N.html"""
+    if page <= 1:
+        return base
+    return base.rstrip("/") + f"/{page}.html"
+
+
+def get_page(cat, url, force=False, page=1):
     os.makedirs(CACHE_DIR, exist_ok=True)
     now = datetime.now(timezone(timedelta(hours=8)))
     day = now.strftime("%Y-%m-%d")
     slot = current_slot()
-    # 缓存按「日期 + 场次」隔离，否则同一天第二场会全部命中早上的缓存
-    cache = os.path.join(CACHE_DIR, f"{cat}-{day}-{slot}.html")
+    # 缓存按「日期 + 场次 + 页码」隔离，否则同一天第二场会全部命中早上的缓存
+    cache = os.path.join(CACHE_DIR, f"{cat}-{page}-{day}-{slot}.html")
     if not force and os.path.exists(cache) and os.path.getsize(cache) > 20000:
         return open(cache, encoding="utf-8", errors="ignore").read(), "cache"
 
@@ -280,21 +288,6 @@ def price_step(p):
     return 50
 
 
-def build_series(pid, price, cat):
-    """首次回溯：以真实当前价为终点，按品类波动向前模拟"""
-    rng = random.Random(int(pid) * 7919)
-    vol, drift = CAT_PARAMS.get(cat, (0.12, -0.03))
-    daily = vol / (252 ** 0.5)
-    levels = [1.0]
-    for _ in range(DAYS - 1):
-        levels.append(levels[-1] * (1 + drift / DAYS + rng.gauss(0, daily)))
-    last = levels[-1]
-    step = price_step(price)
-    series = [max(1, int(round(price * lv / last / step) * step)) for lv in levels]
-    series[-1] = price
-    return series
-
-
 def load_snapshots():
     """读取历史快照 -> {day: {pid: price}}
        文件名支持 YYYY-MM-DD.json 与 YYYY-MM-DD-12.json / -23.json；
@@ -325,6 +318,7 @@ def load_snapshots():
 def main():
     dry = "--dry" in sys.argv
     force = "--force" in sys.argv
+    rebuild = "--rebuild" in sys.argv
     now = datetime.now(timezone(timedelta(hours=8)))
     day = now.strftime("%Y-%m-%d")
     slot = current_slot()
@@ -332,18 +326,40 @@ def main():
     t0 = time.time()
     cat_counts = {}
     all_items, seen = [], set()
+
+    if rebuild:
+        # 只用已有快照重建 data.json，不联网、不写新快照
+        old = json.load(open(os.path.join(DATA_DIR, "data.json"), encoding="utf-8"))
+        products = [{"pid": p["pid"], "name": p["name"], "cat": p["cat"],
+                     "brand": p.get("brand", ""), "url": p.get("url", ""),
+                     "price": p["price"]} for p in old["products"]]
+        label_of = {k: lbl for k, lbl, _ in CATS}
+        for p in products:
+            lbl = label_of.get(p["cat"], p["cat"])
+            cat_counts[lbl] = cat_counts.get(lbl, 0) + 1
+        for key, label, url in CATS:
+            cat_counts.setdefault(label, 0)
+            print(f"{label:<4} {cat_counts[label]:>3} 条  [rebuild]")
+        return build_and_write(products, cat_counts, now, day, slot, dry, rebuild, t0)
+
     for key, label, url in CATS:
-        html, mode = get_page(key, url, force)
-        items = parse_items(html, key) if html else []
+        items, modes = [], set()
+        for pg in range(1, PAGES + 1):
+            html, mode = get_page(key, page_url(url, pg), force, pg)
+            modes.add(mode)
+            got = parse_items(html, key) if html else []
+            items.extend(got)
+            if mode != "cache":
+                time.sleep(2.4)
+            if not got:
+                break   # 没解析到东西，通常是到末页或被拦，不再往后翻
         cat_counts[label] = len(items)
-        print(f"{label:<4} {len(items):>3} 条  [{mode}]")
+        print(f"{label:<4} {len(items):>3} 条  [{'+'.join(sorted(modes))}] × {PAGES}页")
         for it in items:
             if it["pid"] in seen:
                 continue
             seen.add(it["pid"])
             all_items.append(it)
-        if mode != "cache":
-            time.sleep(2.4)
 
     dedup = {}
     for it in all_items:
@@ -365,29 +381,43 @@ def main():
         })
         sys.exit(1)
 
-    # 先落本场快照，再读回，保证 realDays 从今天开始计算
-    os.makedirs(SNAP_DIR, exist_ok=True)
-    snap_path = os.path.join(SNAP_DIR, f"{day}-{slot}.json")
-    snap_tmp = snap_path + ".tmp"
-    with open(snap_tmp, "w", encoding="utf-8") as f:
-        json.dump({"day": day, "slot": slot,
-                   "items": {p["pid"]: p["price"] for p in products}},
-                  f, ensure_ascii=False)
-    os.replace(snap_tmp, snap_path)
+    return build_and_write(products, cat_counts, now, day, slot, dry, rebuild, t0)
+
+
+def build_and_write(products, cat_counts, now, day, slot, dry, rebuild, t0):
+    """把「本期报价 + 历史快照」合成 data.json。
+    时间轴 = 首个快照日 → 今天，长度随采集天数自然增长；
+    没有采到的日期一律留空（None），不做任何回溯估算。"""
+    if not rebuild:
+        os.makedirs(SNAP_DIR, exist_ok=True)
+        snap_path = os.path.join(SNAP_DIR, f"{day}-{slot}.json")
+        snap_tmp = snap_path + ".tmp"
+        with open(snap_tmp, "w", encoding="utf-8") as f:
+            json.dump({"day": day, "slot": slot,
+                       "items": {p["pid"]: p["price"] for p in products}},
+                      f, ensure_ascii=False)
+        os.replace(snap_tmp, snap_path)
 
     snaps = load_snapshots()
     snap_days = sorted(snaps.keys())
-    dates = [(now - timedelta(days=DAYS - 1 - i)).strftime("%Y-%m-%d") for i in range(DAYS)]
+
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if snap_days:
+        first = datetime.strptime(snap_days[0], "%Y-%m-%d").replace(tzinfo=today.tzinfo)
+        total = (today - first).days + 1
+    else:
+        total = 1
+    total = max(1, min(total, DAYS))
+    dates = [(today - timedelta(days=total - 1 - i)).strftime("%Y-%m-%d") for i in range(total)]
     date_idx = {d: i for i, d in enumerate(dates)}
 
     for p in products:
-        series = build_series(p["pid"], p["price"], p["cat"])
+        series = [None] * len(dates)
         for d in snap_days:
             if d in date_idx and p["pid"] in snaps[d]:
                 series[date_idx[d]] = snaps[d][p["pid"]]
-        series[-1] = p["price"]
         p["series"] = series
-        p["realDays"] = sum(1 for d in snap_days if p["pid"] in snaps[d])
+        p["realDays"] = sum(1 for v in series if v is not None)
 
     payload = {
         "updated": now.isoformat(timespec="seconds"),
@@ -395,7 +425,7 @@ def main():
         "slot": slot,
         "source": "中关村在线 (detail.zol.com.cn)",
         "count": len(products),
-        "days": DAYS,
+        "days": len(dates),
         "dates": dates,
         "realSince": snap_days[0] if snap_days else day,
         "products": products,
@@ -403,7 +433,7 @@ def main():
 
     empty_cats = [k for k, v in cat_counts.items() if v == 0]
     status = "partial" if empty_cats else "ok"
-    message = "抓取正常" if not empty_cats else ("以下品类无数据：" + "、".join(empty_cats))
+    message = "采集正常" if not empty_cats else ("以下品类无数据：" + "、".join(empty_cats))
     write_log({
         "time": now.isoformat(timespec="seconds"),
         "type": "price", "status": status, "slot": slot,
@@ -411,11 +441,12 @@ def main():
         "cats": cat_counts, "message": message
     })
 
-    print(f"\n合计 {len(products)} 款 · 场次 {slot} 点 · 真实快照 {len(snap_days)} 天")
+    print(f"\n合计 {len(products)} 款 · 场次 {slot} 点 · 真实日期 {len(dates)} 天"
+          f"（{dates[0]} ~ {dates[-1]}）· 快照场次 {len(snap_days)}")
 
     if dry:
         for p in products[:12]:
-            print(f"  {p['cat']:<10} {p['name'][:34]:<36} ¥{p['price']:<7} 序列{len(p['series'])}")
+            print(f"  {p['cat']:<10} {p['name'][:34]:<36} ¥{p['price']:<7} 真实点{p['realDays']}")
         return
 
     os.makedirs(DATA_DIR, exist_ok=True)
